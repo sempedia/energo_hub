@@ -1,0 +1,307 @@
+# omnivise-lite
+
+## 📁 Project Structure
+
+```
+omnivise-lite/
+├── sensor_simulator/
+│   └── simulate.py
+├── ingestor_service/
+│   ├── app.py
+│   ├── models.py
+│   └── db.py
+├── api_service/
+│   ├── main.py
+│   └── crud.py
+├── alert_service/
+│   └── alerts.py
+├── docker-compose.yml
+├── Dockerfiles/
+│   ├── ingestor.Dockerfile
+│   ├── api.Dockerfile
+│   └── alert.Dockerfile
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## 📦 `requirements.txt`
+```txt
+flask
+fastapi
+uvicorn
+redis
+sqlalchemy
+psycopg2-binary
+requests
+python-dotenv
+alembic
+```
+
+---
+
+## 📄 `sensor_simulator/simulate.py`
+```python
+import requests
+import time
+import random
+
+INGEST_URL = "http://localhost:5001/ingest"
+SENSOR_IDS = ["sensor-1", "sensor-2"]
+
+while True:
+    for sensor_id in SENSOR_IDS:
+        payload = {
+            "sensor_id": sensor_id,
+            "temperature": round(random.uniform(20, 120), 2),
+            "power_output": round(random.uniform(50, 500), 2)
+        }
+        try:
+            res = requests.post(INGEST_URL, json=payload)
+            print(f"[{sensor_id}] Sent: {payload}, Status: {res.status_code}")
+        except Exception as e:
+            print(f"Error sending data: {e}")
+    time.sleep(10)
+```
+
+---
+
+## 📄 `ingestor_service/app.py`
+```python
+from flask import Flask, request, jsonify
+from redis import Redis
+from models import SensorData
+from db import session, init_db
+
+app = Flask(__name__)
+redis_client = Redis(host='redis', port=6379, decode_responses=True)
+
+init_db()
+
+@app.route("/ingest", methods=["POST"])
+def ingest():
+    data = request.get_json()
+    sensor = SensorData(**data)
+    session.add(sensor)
+    session.commit()
+
+    if data["temperature"] > 100:
+        redis_client.publish("alerts", f"🔥 {data['sensor_id']} high temp: {data['temperature']}°C")
+
+    return jsonify({"status": "stored"})
+
+if __name__ == '__main__':
+    app.run(host="0.0.0.0", port=5001)
+```
+
+---
+
+## 📄 `ingestor_service/models.py`
+```python
+from sqlalchemy import Column, String, Float, Integer, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from datetime import datetime
+
+Base = declarative_base()
+
+class SensorData(Base):
+    __tablename__ = 'sensor_data'
+
+    id = Column(Integer, primary_key=True)
+    sensor_id = Column(String)
+    temperature = Column(Float)
+    power_output = Column(Float)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+```
+
+---
+
+## 📄 `ingestor_service/db.py`
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from models import Base
+import os
+
+DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@db:5432/omnivise")
+
+engine = create_engine(DB_URL)
+Session = sessionmaker(bind=engine)
+session = Session()
+
+def init_db():
+    Base.metadata.create_all(engine)
+```
+
+---
+
+## 📄 `api_service/main.py`
+```python
+from fastapi import FastAPI, Query
+from crud import get_latest, get_history
+
+app = FastAPI()
+
+@app.get("/latest")
+def latest(sensor_id: str):
+    return get_latest(sensor_id)
+
+@app.get("/history")
+def history(sensor_id: str, start: str, end: str):
+    return get_history(sensor_id, start, end)
+```
+
+---
+
+## 📄 `api_service/crud.py`
+```python
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.sql import text
+import os
+
+DB_URL = os.getenv("DB_URL", "postgresql://postgres:postgres@db:5432/omnivise")
+engine = create_engine(DB_URL)
+Session = sessionmaker(bind=engine)
+session = Session()
+
+def get_latest(sensor_id):
+    query = text("SELECT * FROM sensor_data WHERE sensor_id=:sid ORDER BY timestamp DESC LIMIT 1")
+    result = session.execute(query, {"sid": sensor_id}).fetchone()
+    return dict(result) if result else {}
+
+def get_history(sensor_id, start, end):
+    query = text("""
+        SELECT * FROM sensor_data
+        WHERE sensor_id=:sid AND timestamp BETWEEN :start AND :end
+        ORDER BY timestamp ASC
+    """)
+    result = session.execute(query, {"sid": sensor_id, "start": start, "end": end}).fetchall()
+    return [dict(row) for row in result]
+```
+
+---
+
+## 📄 `alert_service/alerts.py`
+```python
+from redis import Redis
+
+redis_client = Redis(host='redis', port=6379, decode_responses=True)
+
+pubsub = redis_client.pubsub()
+pubsub.subscribe("alerts")
+
+print("🚨 Alert Service Running...")
+
+for msg in pubsub.listen():
+    if msg['type'] == 'message':
+        print(f"⚠️  ALERT: {msg['data']}")
+```
+
+---
+
+## 🐳 `docker-compose.yml`
+```yaml
+version: '3.8'
+
+services:
+  db:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: omnivise
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+  ingestor:
+    build:
+      context: ./Dockerfiles
+      dockerfile: ingestor.Dockerfile
+    ports:
+      - "5001:5001"
+    depends_on:
+      - db
+      - redis
+
+  api:
+    build:
+      context: ./Dockerfiles
+      dockerfile: api.Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+
+  alert:
+    build:
+      context: ./Dockerfiles
+      dockerfile: alert.Dockerfile
+    depends_on:
+      - redis
+```
+
+---
+
+## 🐳 `Dockerfiles/ingestor.Dockerfile`
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY ../ingestor_service /app
+RUN pip install flask redis sqlalchemy psycopg2-binary
+CMD ["python", "app.py"]
+```
+
+---
+
+## 🐳 `Dockerfiles/api.Dockerfile`
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY ../api_service /app
+RUN pip install fastapi uvicorn sqlalchemy psycopg2-binary
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+---
+
+## 🐳 `Dockerfiles/alert.Dockerfile`
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY ../alert_service /app
+RUN pip install redis
+CMD ["python", "alerts.py"]
+```
+
+---
+
+## 📘 `README.md`
+```markdown
+# Omnivise Lite
+
+A prototype energy-sector IoT + Data Storage platform inspired by Siemens Energy.
+
+## Features
+- Sensor data ingestion
+- Real-time alerts via Redis pub/sub
+- Time-series data storage in PostgreSQL
+- REST API to query data
+- Dockerized microservice architecture
+
+## Quick Start
+```bash
+docker-compose up --build
+```
+
+## API Endpoints
+- `POST /ingest` - Ingest sensor data
+- `GET /latest?sensor_id=sensor-1`
+- `GET /history?sensor_id=sensor-1&start=...&end=...`
+```

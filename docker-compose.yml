@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: postgres      # PostgreSQL user
+      POSTGRES_PASSWORD: postgres  # Password for user
+      POSTGRES_DB: omnivise        # Database name
+    ports:
+      - "5432:5432"                # Expose port for local access
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"                # Redis port
+
+  ingestor:
+    build:
+      context: ./Dockerfiles
+      dockerfile: ingestor.Dockerfile
+    ports:
+      - "5001:5001"                # Expose ingest API port
+    depends_on:
+      - db                        # Start after db is ready
+      - redis                     # Start after redis is ready
+
+  api:
+    build:
+      context: ./Dockerfiles
+      dockerfile: api.Dockerfile
+    ports:
+      - "8000:8000"                # Expose API port
+    depends_on:
+      - db                        # Depends on DB being ready
+
+  alert:
+    build:
+      context: ./Dockerfiles
+      dockerfile: alert.Dockerfile
+    depends_on:
+      - redis                     # Depends on Redis to receive alerts
